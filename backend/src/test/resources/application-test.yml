@@ -1,0 +1,10 @@
+spring:
+  datasource:
+    url: jdbc:postgresql://127.0.0.1:5432/ccdev_test
+    username: ccdev
+    password: ccdev
+
+labroute:
+  seed-demo-tenants: false
+  operator-token: test-operator-token
+  master-key: test-master-key-32-bytes-long!!!!!

@@ -1,0 +1,47 @@
+services:
+  db:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: ccdev
+      POSTGRES_USER: ccdev
+      POSTGRES_PASSWORD: ccdev
+    volumes:
+      - labroute-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ccdev -d ccdev"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    ports:
+      - "5432:5432"
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/ccdev
+      DB_USER: ccdev
+      DB_PASSWORD: ccdev
+      OPERATOR_TOKEN: labroute-operator-demo
+      MASTER_KEY: labroute-dev-master-key-32bytes!!
+      SEED_DEMO_TENANTS: "true"
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    depends_on:
+      - backend
+    ports:
+      - "5173:80"
+    restart: unless-stopped
+
+volumes:
+  labroute-db:

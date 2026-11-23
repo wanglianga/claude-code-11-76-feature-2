@@ -1,0 +1,33 @@
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+spring:
+  application:
+    name: labroute
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://127.0.0.1:5432/ccdev}
+    username: ${DB_USER:ccdev}
+    password: ${DB_PASSWORD:ccdev}
+    hikari:
+      maximum-pool-size: 16
+      pool-name: labroute-pool
+  jackson:
+    serialization:
+      write-dates-as-timestamps: false
+    default-property-inclusion: non_null
+
+labroute:
+  operator-token: ${OPERATOR_TOKEN:labroute-operator-demo}
+  master-key: ${MASTER_KEY:labroute-dev-master-key-32bytes!!}
+  demo-mode: ${DEMO_MODE:true}
+  auth:
+    standard-skew-seconds: 900
+    strict-skew-seconds: 120
+  seed-demo-tenants: ${SEED_DEMO_TENANTS:true}
+
+logging:
+  level:
+    root: INFO
+    com.labroute: INFO
+    org.springframework.jdbc.core: WARN
