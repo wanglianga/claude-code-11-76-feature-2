@@ -31,6 +31,36 @@ public class CryptoSupport {
         return mapper;
     }
 
+    /**
+     * Converts a jsonb column value into a JsonNode so API responses carry real JSON
+     * instead of the driver's wrapper object. The PostgreSQL driver is runtime-scoped,
+     * so the wrapper is recognised by class name; its toString() yields the json text.
+     * Other values pass through unchanged.
+     */
+    public Object jsonValue(Object value) {
+        if (value != null && "org.postgresql.util.PGobject".equals(value.getClass().getName())) {
+            String text = String.valueOf(value);
+            try {
+                return readTree(text);
+            } catch (Exception e) {
+                return text;
+            }
+        }
+        return value;
+    }
+
+    /** Applies {@link #jsonValue(Object)} to every entry of a row map. */
+    public Map<String, Object> jsonValues(Map<String, Object> row) {
+        row.replaceAll((k, v) -> jsonValue(v));
+        return row;
+    }
+
+    /** Applies {@link #jsonValue(Object)} to every entry of every row. */
+    public List<Map<String, Object>> jsonValues(List<Map<String, Object>> rows) {
+        rows.forEach(this::jsonValues);
+        return rows;
+    }
+
     /** Deterministic JSON with recursively sorted object keys, used for hashing and signatures. */
     public String canonicalJson(Object value) {
         try {

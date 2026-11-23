@@ -88,4 +88,61 @@ class SemanticValidatorTest {
         var r = validator.validate("TELEPATHY", json("{}"));
         assertThat(r.status()).isEqualTo("REJECTED");
     }
+
+    @Test
+    void validCalibrationClearsAllChecks() throws Exception {
+        var r = validator.validate("CALIBRATION", json("""
+                {"calibrationId":"CAL-1","instrumentCode":"AU5800","status":"PASSED",
+                 "validFrom":"2026-01-01T00:00:00Z","validUntil":"2026-02-01T00:00:00Z"}
+                """));
+        assertThat(r.status()).isEqualTo("VALID");
+        assertThat(r.rejected()).isFalse();
+    }
+
+    @Test
+    void invertedCalibrationWindowIsRejected() throws Exception {
+        var r = validator.validate("CALIBRATION", json("""
+                {"calibrationId":"CAL-1","instrumentCode":"AU5800","status":"PASSED",
+                 "validFrom":"2026-02-01T00:00:00Z","validUntil":"2026-01-01T00:00:00Z"}
+                """));
+        assertThat(r.status()).isEqualTo("REJECTED");
+        assertThat(r.findings()).anyMatch(f -> f.code().equals("CALIBRATION_WINDOW_INVERTED"));
+    }
+
+    @Test
+    void calibrationWithoutWindowIsRejected() throws Exception {
+        var r = validator.validate("CALIBRATION", json("""
+                {"calibrationId":"CAL-1","instrumentCode":"AU5800","status":"PASSED"}
+                """));
+        assertThat(r.status()).isEqualTo("REJECTED");
+        assertThat(r.findings()).anyMatch(f -> f.code().equals("CALIBRATION_WINDOW_MISSING"));
+    }
+
+    @Test
+    void qcWithoutPerformedAtIsRejected() throws Exception {
+        var r = validator.validate("QC_RECORD", json("""
+                {"qcId":"QC-1","instrumentCode":"AU5800","status":"FAILED"}
+                """));
+        assertThat(r.status()).isEqualTo("REJECTED");
+        assertThat(r.findings()).anyMatch(f -> f.code().equals("QC_PERFORMED_AT_MISSING"));
+    }
+
+    @Test
+    void qcSelfRevocationIsRejected() throws Exception {
+        var r = validator.validate("QC_RECORD", json("""
+                {"qcId":"QC-1","instrumentCode":"AU5800","status":"PASSED",
+                 "performedAt":"2026-01-02T00:00:00Z","revokesQcId":"QC-1"}
+                """));
+        assertThat(r.status()).isEqualTo("REJECTED");
+        assertThat(r.findings()).anyMatch(f -> f.code().equals("QC_REVOCATION_SELF"));
+    }
+
+    @Test
+    void validQcRevocationClearsAllChecks() throws Exception {
+        var r = validator.validate("QC_RECORD", json("""
+                {"qcId":"QC-2","instrumentCode":"AU5800","status":"PASSED",
+                 "performedAt":"2026-01-02T00:00:00Z","revokesQcId":"QC-1"}
+                """));
+        assertThat(r.status()).isEqualTo("VALID");
+    }
 }

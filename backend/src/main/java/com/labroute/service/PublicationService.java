@@ -31,14 +31,17 @@ public class PublicationService {
     private final CryptoSupport crypto;
     private final EvidenceService evidence;
     private final MigrationService migrations;
+    private final RestrictionService restrictions;
 
     public PublicationService(JdbcTemplate jdbc, TenantService tenants, CryptoSupport crypto,
-                              EvidenceService evidence, MigrationService migrations) {
+                              EvidenceService evidence, MigrationService migrations,
+                              RestrictionService restrictions) {
         this.jdbc = jdbc;
         this.tenants = tenants;
         this.crypto = crypto;
         this.evidence = evidence;
         this.migrations = migrations;
+        this.restrictions = restrictions;
     }
 
     public record PublishResult(Map<String, Object> body, int httpStatus) {
@@ -126,6 +129,30 @@ public class PublicationService {
         Map<String, Object> newest = revisions.get(0);
         int revision = ((Number) newest.get("revision")).intValue();
         String validation = latestValidation(tenant.tenantId(), reportId, revision);
+
+        // The restriction register wins over every other consideration: a report whose
+        // usability was downgraded by a backfilled QC/calibration record is answered with
+        // an explicit pending state naming the restriction and the last verified version.
+        List<Map<String, Object>> activeRestrictions = restrictions.activeFor(tenant.tenantId(), reportId);
+        if (!activeRestrictions.isEmpty()) {
+            String reason = "publication restricted by "
+                    + activeRestrictions.stream()
+                    .map(r -> r.get("reasonCode") + " (usability " + r.get("oldUsability")
+                            + " -> " + r.get("newUsability") + ")")
+                    .collect(java.util.stream.Collectors.joining(", "))
+                    + "; awaiting review";
+            Map<String, Object> body = pendingBody(tenant, reportId, revision, readSpace, reason,
+                    buffered, revisions);
+            body.put("restrictions", activeRestrictions);
+            body.put("downstreamRefs", restrictions.downstreamRefs(tenant.tenantId(), reportId));
+            recordPublication(tenant, reportId, revision, readSpace, "PENDING_VERIFICATION", body, reason);
+            evidence.append(tenant.tenantId(), "REPORT_PENDING", "REPORT", reportId, readSpace,
+                    "PENDING_VERIFICATION", Map.of("reportId", reportId, "revision", revision,
+                            "reason", reason,
+                            "restrictions", activeRestrictions.stream()
+                                    .map(r -> String.valueOf(r.get("restrictionId"))).toList()));
+            return new PublishResult(body, 202);
+        }
 
         Optional<Map<String, Object>> pendingMeta = latestPendingRevision(tenant.tenantId(), reportId, revision);
         boolean fenced = migrations.currentFence(tenant.tenantId()).isPresent();
@@ -226,17 +253,33 @@ public class PublicationService {
                                    String visibleState, Map<String, Object> body, String reason) {
         String hash = body.get("contentHash") != null ? String.valueOf(body.get("contentHash"))
                 : String.valueOf(body.get("lastVerifiedContentHash"));
+        // A revision that has been consumed downstream is frozen: its publication row keeps
+        // the original verified state and content hash, and later serves only append to the
+        // append-only publication event ledger. History is never overwritten in place.
+        boolean rowExists = Boolean.TRUE.equals(jdbc.queryForObject(
+                "select count(*) > 0 from lab.report_publication " +
+                        "where tenant_id = ?::uuid and report_id = ? and revision = ?",
+                Boolean.class, tenant.tenantId(), reportId, revision));
+        boolean frozen = rowExists
+                && restrictions.isRevisionReferenced(tenant.tenantId(), reportId, revision);
+        if (!frozen) {
+            jdbc.update("""
+                    insert into lab.report_publication(publication_id, tenant_id, report_id, revision,
+                      source_space, visible_state, content_hash, pending_reason)
+                    values (gen_random_uuid(), ?::uuid, ?, ?, ?, ?, ?, ?)
+                    on conflict (tenant_id, report_id, revision) do update set
+                      source_space = excluded.source_space,
+                      visible_state = excluded.visible_state,
+                      content_hash = excluded.content_hash,
+                      pending_reason = excluded.pending_reason,
+                      updated_at = now()
+                    """, tenant.tenantId(), reportId, revision, space, visibleState, hash, reason);
+        }
         jdbc.update("""
-                insert into lab.report_publication(publication_id, tenant_id, report_id, revision,
-                  source_space, visible_state, content_hash, pending_reason)
-                values (gen_random_uuid(), ?::uuid, ?, ?, ?, ?, ?, ?)
-                on conflict (tenant_id, report_id, revision) do update set
-                  source_space = excluded.source_space,
-                  visible_state = excluded.visible_state,
-                  content_hash = excluded.content_hash,
-                  pending_reason = excluded.pending_reason,
-                  updated_at = now()
-                """, tenant.tenantId(), reportId, revision, space, visibleState, hash, reason);
+                insert into lab.publication_event(event_id, tenant_id, report_id, revision,
+                  source_space, visible_state, content_hash, pending_reason, frozen)
+                values (gen_random_uuid(), ?::uuid, ?, ?, ?, ?, ?, ?, ?)
+                """, tenant.tenantId(), reportId, revision, space, visibleState, hash, reason, frozen);
     }
 
     public List<Map<String, Object>> publications(String tenantId, int limit) {

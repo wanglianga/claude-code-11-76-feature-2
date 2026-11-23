@@ -47,7 +47,7 @@ public class SpaceWriter {
         switch (messageType) {
             case "SAMPLE" -> applySample(schema, messageId, seq, payload);
             case "RESULT" -> applyResult(schema, messageId, seq, payload);
-            case "REPORT_REVISION" -> applyReport(schema, messageId, seq, payload);
+            case "REPORT_REVISION" -> applyReport(tenant, schema, messageId, seq, payload);
             case "OBJECT" -> applyObject(schema, messageId, seq, payload);
             default -> throw new IllegalArgumentException("unroutable message type " + messageType);
         }
@@ -111,9 +111,39 @@ public class SpaceWriter {
                 p.path("status").asText("RECEIVED"), crypto.canonicalJson(p), messageId.toString(), seq);
     }
 
-    private void applyReport(String schema, UUID messageId, long seq, JsonNode p) {
+    private void applyReport(Tenant tenant, String schema, UUID messageId, long seq, JsonNode p) {
         String content = crypto.canonicalJson(p.has("content") ? p.get("content") : p);
         String hash = crypto.sha256Hex(content);
+        String reportId = p.path("reportId").asText();
+        int revision = p.path("revision").asInt(1);
+        // A revision that has been referenced downstream is immutable history: a later
+        // message carrying different content for the same (report, revision) is persisted
+        // and receipted by the gateway, but it must not overwrite the consumed version.
+        // Corrections have to arrive as a new revision.
+        Integer referenced = jdbc.queryForObject("""
+                select count(*) from lab.report_downstream_ref
+                where tenant_id = ?::uuid and report_id = ? and revision = ?
+                """, Integer.class, tenant.tenantId(), reportId, revision);
+        if (referenced != null && referenced > 0) {
+            String existingHash = jdbc.query(
+                    "select content_hash from " + schema + ".report_revision where report_id = ? and revision = ?",
+                    rs -> rs.next() ? rs.getString(1) : null, reportId, revision);
+            if (existingHash != null && !existingHash.equals(hash)) {
+                jdbc.update("""
+                        insert into lab.semantic_finding(finding_id, tenant_id, report_id, rule_code,
+                          severity, message, detail)
+                        values (?::uuid, ?::uuid, ?, ?, 'WARN', ?, ?::jsonb)
+                        """, UUID.randomUUID().toString(), tenant.tenantId(), reportId,
+                        "REPORT_REVISION_IMMUTABLE",
+                        "revision " + revision + " of " + reportId + " was referenced downstream; "
+                                + "diverging content was not applied over the consumed version",
+                        crypto.canonicalJson(java.util.Map.of(
+                                "reportId", reportId, "revision", revision,
+                                "existingHash", existingHash, "rejectedHash", hash,
+                                "messageId", messageId.toString())));
+                return;
+            }
+        }
         jdbc.update("""
                 insert into %1$s.report_revision(report_id, revision, sample_id, content, content_hash,
                   source_space, origin_message_id, updated_seq)
@@ -126,7 +156,7 @@ public class SpaceWriter {
                   updated_seq = excluded.updated_seq
                 where %1$s.report_revision.updated_seq < excluded.updated_seq
                 """.formatted(schema),
-                p.path("reportId").asText(), p.path("revision").asInt(1),
+                reportId, revision,
                 p.path("sampleId").asText(), content, hash, messageId.toString(), seq);
     }
 

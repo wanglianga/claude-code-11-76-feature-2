@@ -46,6 +46,8 @@ public class SemanticValidator {
             case "RESULT" -> validateResult(payload, f);
             case "REPORT_REVISION" -> validateReport(payload, f);
             case "OBJECT" -> validateObject(payload, f);
+            case "CALIBRATION" -> validateCalibration(payload, f);
+            case "QC_RECORD" -> validateQc(payload, f);
             default -> f.add(finding("UNKNOWN_MESSAGE_TYPE", "ERROR",
                     "message type " + messageType + " is not routable", null));
         }
@@ -151,6 +153,64 @@ public class SemanticValidator {
         String type = p.path("objectType").asText("UNKNOWN");
         if (!Set.of("RAW_PDF", "IMAGE", "XML", "JSON", "UNKNOWN").contains(type)) {
             f.add(finding("OBJECT_TYPE_UNKNOWN", "WARN", "objectType " + type + " is unmapped", null));
+        }
+    }
+
+    private void validateCalibration(JsonNode p, List<Finding> f) {
+        primaryKey(p, "calibrationId", "^[A-Za-z0-9_.:-]{3,64}$", f);
+        primaryKey(p, "instrumentCode", "^[A-Za-z0-9_.:-]{2,64}$", f);
+        String status = p.path("status").asText("PASSED");
+        if (!Set.of("PASSED", "FAILED").contains(status)) {
+            f.add(finding("CALIBRATION_STATUS_INVALID", "ERROR",
+                    "status must be PASSED or FAILED", text("status", status)));
+        }
+        java.time.OffsetDateTime from = timestamp(p, "validFrom");
+        java.time.OffsetDateTime until = timestamp(p, "validUntil");
+        if (from == null) {
+            f.add(finding("CALIBRATION_WINDOW_MISSING", "ERROR",
+                    "validFrom is required; the validity map cannot place an open-ended start", null));
+        }
+        if (until == null) {
+            f.add(finding("CALIBRATION_WINDOW_MISSING", "ERROR",
+                    "validUntil is required; the validity map cannot place an open-ended end", null));
+        }
+        if (from != null && until != null && !from.isBefore(until)) {
+            f.add(finding("CALIBRATION_WINDOW_INVERTED", "ERROR",
+                    "validFrom must be earlier than validUntil", text("validFrom", from)));
+        }
+    }
+
+    private void validateQc(JsonNode p, List<Finding> f) {
+        primaryKey(p, "qcId", "^[A-Za-z0-9_.:-]{3,64}$", f);
+        primaryKey(p, "instrumentCode", "^[A-Za-z0-9_.:-]{2,64}$", f);
+        String status = p.path("status").asText("PASSED");
+        if (!Set.of("PASSED", "FAILED").contains(status)) {
+            f.add(finding("QC_STATUS_INVALID", "ERROR",
+                    "status must be PASSED or FAILED", text("status", status)));
+        }
+        if (timestamp(p, "performedAt") == null) {
+            f.add(finding("QC_PERFORMED_AT_MISSING", "ERROR",
+                    "performedAt is required; the QC watermark cannot order a timeless record", null));
+        }
+        if (p.hasNonNull("revokesQcId")) {
+            String revokes = p.get("revokesQcId").asText();
+            if (revokes.isBlank()) {
+                f.add(finding("QC_REVOCATION_TARGET_INVALID", "ERROR", "revokesQcId must not be blank", null));
+            } else if (revokes.equals(p.path("qcId").asText())) {
+                f.add(finding("QC_REVOCATION_SELF", "ERROR", "a QC record cannot revoke itself", null));
+            }
+        }
+    }
+
+    private java.time.OffsetDateTime timestamp(JsonNode p, String field) {
+        JsonNode v = p.get(field);
+        if (v == null || v.isNull() || v.asText().isBlank()) {
+            return null;
+        }
+        try {
+            return java.time.OffsetDateTime.parse(v.asText());
+        } catch (Exception e) {
+            return null;
         }
     }
 

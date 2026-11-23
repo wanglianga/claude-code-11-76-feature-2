@@ -44,10 +44,11 @@ public class IntakeService {
     private final SpaceWriter writer;
     private final EvidenceService evidence;
     private final ReplicationService replication;
+    private final AppliedMessageHooks hooks;
 
     public IntakeService(JdbcTemplate jdbc, TenantService tenants, AuthService auth, CryptoSupport crypto,
                          SemanticValidator validator, SpaceWriter writer, EvidenceService evidence,
-                         ReplicationService replication) {
+                         ReplicationService replication, AppliedMessageHooks hooks) {
         this.jdbc = jdbc;
         this.tenants = tenants;
         this.auth = auth;
@@ -56,6 +57,7 @@ public class IntakeService {
         this.writer = writer;
         this.evidence = evidence;
         this.replication = replication;
+        this.hooks = hooks;
     }
 
     public record IntakeRequest(String tenantCode, String endpoint, String messageType,
@@ -68,14 +70,18 @@ public class IntakeService {
             "SAMPLE", "/api/intake/sample",
             "RESULT", "/api/intake/result",
             "REPORT_REVISION", "/api/intake/report",
-            "OBJECT", "/api/intake/object"
+            "OBJECT", "/api/intake/object",
+            "CALIBRATION", "/api/intake/calibration",
+            "QC_RECORD", "/api/intake/qc"
     );
 
     private static final Map<String, String> PATH_TO_TYPE = Map.of(
             "/api/intake/sample", "SAMPLE",
             "/api/intake/result", "RESULT",
             "/api/intake/report", "REPORT_REVISION",
-            "/api/intake/object", "OBJECT"
+            "/api/intake/object", "OBJECT",
+            "/api/intake/calibration", "CALIBRATION",
+            "/api/intake/qc", "QC_RECORD"
     );
 
     public static String pathForType(String type) {
@@ -192,6 +198,9 @@ public class IntakeService {
         }
 
         // 3) Apply or buffer, exactly once, in the routing space the gate chose.
+        //    CALIBRATION / QC_RECORD are control-plane registry writes (singular, not
+        //    dual-written); each one also triggers an incremental re-evaluation job.
+        Map<String, Object> qualityJob = null;
         if (validation.rejected()) {
             // persisted, not applied
         } else if ("FENCE".equals(writeSpace)) {
@@ -206,9 +215,18 @@ public class IntakeService {
                     where fence_id = ?::uuid
                     """, seq, fenceId);
             routes.add("BUFFERED");
+        } else if (QualityService.isRegistryType(messageType)) {
+            qualityJob = hooks.applyRegistry(tenant, messageId, seq, messageType, payload);
+            appliedSpace = "REGISTRY";
+            routes.add("REGISTRY");
+            jdbc.update("""
+                    update lab.intake_message set applied_space = ? where message_id = ?::uuid
+                    """, appliedSpace, messageId.toString());
         } else if ("DUAL".equals(writeSpace)) {
             writer.apply(tenant, "OLD", messageId, seq, messageType, payload);
+            hooks.afterSpaceApply(tenant, "OLD", messageId, seq, messageType, payload);
             writer.apply(tenant, "NEW", messageId, seq, messageType, payload);
+            hooks.afterSpaceApply(tenant, "NEW", messageId, seq, messageType, payload);
             appliedSpace = "OLD+NEW";
             status = "APPLIED_DUAL";
             routes.add("OLD");
@@ -218,6 +236,7 @@ public class IntakeService {
                     """, status, appliedSpace, messageId.toString());
         } else if ("NEW".equals(writeSpace)) {
             writer.apply(tenant, "NEW", messageId, seq, messageType, payload);
+            hooks.afterSpaceApply(tenant, "NEW", messageId, seq, messageType, payload);
             appliedSpace = "NEW";
             routes.add("NEW");
             jdbc.update("""
@@ -225,6 +244,7 @@ public class IntakeService {
                     """, appliedSpace, messageId.toString());
         } else if ("OLD".equals(writeSpace)) {
             writer.apply(tenant, "OLD", messageId, seq, messageType, payload);
+            hooks.afterSpaceApply(tenant, "OLD", messageId, seq, messageType, payload);
             appliedSpace = "OLD";
             routes.add("OLD");
             jdbc.update("""
@@ -266,6 +286,12 @@ public class IntakeService {
         receipt.put("writeSpaceAtReceipt", writeSpace);
         receipt.put("payloadHash", payloadHash);
         receipt.put("generation", tenant.generation());
+        if (qualityJob != null) {
+            receipt.put("reevalJob", Map.of(
+                    "jobId", String.valueOf(qualityJob.get("jobId")),
+                    "strategy", String.valueOf(qualityJob.get("strategy")),
+                    "status", String.valueOf(qualityJob.get("status"))));
+        }
         if (validation.rejected()) {
             throw new PersistedRejection(receipt);
         }
@@ -351,6 +377,8 @@ public class IntakeService {
             case "RESULT" -> "result:" + p.path("resultId").asText();
             case "REPORT_REVISION" -> "report:" + p.path("reportId").asText() + "#" + p.path("revision").asText();
             case "OBJECT" -> "object:" + p.path("objectKey").asText();
+            case "CALIBRATION" -> "calibration:" + p.path("calibrationId").asText();
+            case "QC_RECORD" -> "qc:" + p.path("qcId").asText();
             default -> "unknown";
         };
     }

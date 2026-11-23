@@ -13,7 +13,7 @@ import java.util.Map;
 import java.util.UUID;
 
 /**
- * Verification laboratory. Runs four deterministic scenarios through the real services
+ * Verification laboratory. Runs deterministic scenarios through the real services
  * (not mocks) and records pass/fail assertions with the evidence that justified each one:
  *
  *   LATE_RESULT        instrument result arrives after its sample and after a report was
@@ -27,6 +27,12 @@ import java.util.UUID;
  *                      for each, order is preserved, drain applies them to NEW in that order,
  *                      release opens the gate, and the report served inside the fence is
  *                      explicitly PENDING_VERIFICATION rather than mixed.
+ *   BACKFILL_REEVAL    backfilled QC/calibration records that predate the switch watermark
+ *                      change the usability of already-published results: a calibration
+ *                      arriving after its result, a QC failure later revoked, and a report
+ *                      already referenced downstream whose history must not be overwritten.
+ *                      Exercises both re-evaluation strategies (INCREMENTAL via the report
+ *                      dependency index, REPLAY over raw results).
  */
 @Service
 public class ScenarioService {
@@ -41,11 +47,16 @@ public class ScenarioService {
     private final CryptoSupport crypto;
     private final ReplicationService replication;
     private final DemoDataService demo;
+    private final ReevaluationService reevaluation;
+    private final QualityService quality;
+    private final RestrictionService restrictions;
 
     public ScenarioService(JdbcTemplate jdbc, TenantService tenants, IntakeService intake,
                            MigrationService migrations, PublicationService publication,
                            EvidenceService evidence, PolicyService policies, CryptoSupport crypto,
-                           ReplicationService replication, DemoDataService demo) {
+                           ReplicationService replication, DemoDataService demo,
+                           ReevaluationService reevaluation, QualityService quality,
+                           RestrictionService restrictions) {
         this.jdbc = jdbc;
         this.tenants = tenants;
         this.intake = intake;
@@ -56,6 +67,9 @@ public class ScenarioService {
         this.crypto = crypto;
         this.replication = replication;
         this.demo = demo;
+        this.reevaluation = reevaluation;
+        this.quality = quality;
+        this.restrictions = restrictions;
     }
 
     public record Assertion(String name, boolean passed, String detail) {
@@ -75,6 +89,7 @@ public class ScenarioService {
                 case "REPORT_REVISION" -> reportRevision(tenant, assertions, artifacts);
                 case "ISOLATION_CHANGE" -> isolationChange(tenant, assertions, artifacts);
                 case "FENCE_BURST" -> fenceBurst(tenant, assertions, artifacts);
+                case "BACKFILL_REEVAL" -> backfillReeval(tenant, assertions, artifacts);
                 default -> throw new IllegalArgumentException("unknown scenario " + scenarioCode);
             }
         } catch (Exception e) {
@@ -246,8 +261,7 @@ public class ScenarioService {
                 select credential_id::text from lab.source_credential where tenant_id = ?::uuid
                 """, restored.tenantId());
         for (Map<String, Object> c : creds) {
-            policies.reauthorise(restored, (String) c.get("credential_id"),
-                    "intake:sample,intake:result,intake:report,intake:object");
+            policies.reauthorise(restored, (String) c.get("credential_id"), AuthService.INTAKE_SCOPES);
         }
         assertions.add(new Assertion("isolation.credentialsReissuedAfterRestore",
                 true, "reissued " + creds.size() + " credential(s) under policy "
@@ -385,6 +399,226 @@ public class ScenarioService {
     }
 
     /**
+     * Backfilled QC/calibration records vs. already-published reports. One fresh instrument
+     * per run keeps the scenario independent of the seeded AU5800 registry and of earlier runs.
+     */
+    private void backfillReeval(Tenant tenant, List<Assertion> assertions, Map<String, Object> art) {
+        tenant = ensureSteady(tenant, assertions, art);
+        // Credentials from an older seed may predate the quality scopes; re-issue them so
+        // the scenario exercises the real signed path regardless of seed vintage.
+        List<Map<String, Object>> creds = jdbc.queryForList("""
+                select credential_id::text from lab.source_credential where tenant_id = ?::uuid
+                """, tenant.tenantId());
+        for (Map<String, Object> c : creds) {
+            policies.reauthorise(tenant, (String) c.get("credential_id"), AuthService.INTAKE_SCOPES);
+        }
+
+        String ins = "INS-" + UUID.randomUUID().toString().substring(0, 6).toUpperCase();
+        OffsetDateTime t0 = OffsetDateTime.now().minusHours(2);
+        art.put("instrument", ins);
+
+        // ---- 样例一：校准在结果后补到 ----
+        String s1 = demo.uniqueKey("BF1-S");
+        String r1 = demo.uniqueKey("BF1-RES");
+        String rep1 = demo.uniqueKey("BF1-R");
+        receipt(tenant, assertions, art, "sample", demo.samplePayload(s1, "SOURCE-A"));
+        receipt(tenant, assertions, art, "result", backfillResult(r1, s1, ins, t0));
+        receipt(tenant, assertions, art, "report", demo.reportPayload(rep1, s1, 1, "before-calibration"));
+
+        Map<String, Object> preCal = publication.publish(tenant.code(), rep1).body();
+        assertions.add(new Assertion("backfill.reportVerifiedBeforeCalibration",
+                "VERIFIED".equals(preCal.get("visibleState")),
+                "state=" + preCal.get("visibleState") + " space=" + preCal.get("sourceSpace")));
+
+        Map<String, Object> gapJob = reevaluation.planAndRun(tenant, "MANUAL", "INCREMENTAL",
+                ins, t0.minusHours(1), t0.plusHours(1), null);
+        art.put("gapJob", gapJob);
+        JsonNode gapDetails = detailsOf(gapJob);
+        assertions.add(new Assertion("backfill.gapMarkedSuspect",
+                hasTransition(gapDetails, r1, "UNEVALUATED", "SUSPECT")
+                        && gapDetails.toString().contains(rep1),
+                "transitions=" + gapDetails.path("transitions")
+                        + " pendingReview=" + gapDetails.path("pendingReviewReports")));
+        Map<String, Object> gapPublish = publication.publish(tenant.code(), rep1).body();
+        assertions.add(new Assertion("backfill.publishPendingUnderGap",
+                "PENDING_VERIFICATION".equals(gapPublish.get("visibleState"))
+                        && gapPublish.get("restrictions") != null,
+                "state=" + gapPublish.get("visibleState") + " reason=" + gapPublish.get("pendingReason")));
+
+        Map<String, Object> calReceipt = receipt(tenant, assertions, art, "calibration",
+                demo.calibrationPayload(demo.uniqueKey("BF1-CAL"), ins,
+                        t0.minusHours(2), t0.plusHours(24), "PASSED"));
+        Map<String, Object> calJob = reevaluation.get(String.valueOf(
+                ((Map<?, ?>) calReceipt.get("reevalJob")).get("jobId")));
+        art.put("calibrationJob", calJob);
+        JsonNode calDetails = detailsOf(calJob);
+        assertions.add(new Assertion("backfill.calibrationBackfillRestoresUsability",
+                hasTransition(calDetails, r1, "SUSPECT", "USABLE"),
+                "transitions=" + calDetails.path("transitions")));
+        Map<String, Object> postCal = publication.publish(tenant.code(), rep1).body();
+        assertions.add(new Assertion("backfill.publishVerifiedAfterCalibration",
+                "VERIFIED".equals(postCal.get("visibleState")),
+                "state=" + postCal.get("visibleState")));
+        assertions.add(new Assertion("backfill.restrictionReleasedAfterCalibration",
+                restrictions.activeFor(tenant.tenantId(), rep1).isEmpty()
+                        && restrictionStatus(tenant.tenantId(), rep1, "RELEASED") > 0,
+                "active=" + restrictions.activeFor(tenant.tenantId(), rep1).size()));
+
+        // ---- 样例二：质控失败被撤销 ----
+        String s2 = demo.uniqueKey("BF2-S");
+        String r2 = demo.uniqueKey("BF2-RES");
+        String rep2 = demo.uniqueKey("BF2-R");
+        receipt(tenant, assertions, art, "sample", demo.samplePayload(s2, "SOURCE-A"));
+        receipt(tenant, assertions, art, "result", backfillResult(r2, s2, ins, t0));
+        receipt(tenant, assertions, art, "report", demo.reportPayload(rep2, s2, 1, "before-qc"));
+
+        String qcFail = demo.uniqueKey("BF2-QCF");
+        receipt(tenant, assertions, art, "qc",
+                demo.qcPayload(qcFail, ins, "FAILED", t0.minusMinutes(30), null));
+        Map<String, Object> qcPublish = publication.publish(tenant.code(), rep2).body();
+        assertions.add(new Assertion("backfill.qcFailureDegrades",
+                "PENDING_VERIFICATION".equals(qcPublish.get("visibleState"))
+                        && String.valueOf(qcPublish.get("pendingReason")).contains("QC_FAILED"),
+                "state=" + qcPublish.get("visibleState") + " reason=" + qcPublish.get("pendingReason")));
+        Map<String, Object> watermark = quality.qcWatermarks(tenant.tenantId(), ins);
+        assertions.add(new Assertion("backfill.qcWatermarkShowsOpenFailure",
+                watermark.toString().contains("FAILED") && watermark.toString().contains(qcFail),
+                "watermark=" + watermark.get("instruments")));
+
+        // REPLAY 策略：直接按仪器+时间窗扫描原始结果，并顺带修复依赖索引。
+        Map<String, Object> replayJob = reevaluation.planAndRun(tenant, "MANUAL", "REPLAY",
+                ins, t0.minusHours(1), t0.plusHours(1), null);
+        art.put("replayJob", replayJob);
+        JsonNode replayStats = statsOf(replayJob);
+        assertions.add(new Assertion("backfill.replayStrategyConcurs",
+                replayStats.path("affectedResults").asInt() >= 2
+                        && replayStats.path("indexEdgesHealed").asInt() >= 2
+                        && !replayStats.path("indexUsed").asBoolean(),
+                "stats=" + replayStats));
+
+        String qcRevoke = demo.uniqueKey("BF2-QCR");
+        Map<String, Object> revokeReceipt = receipt(tenant, assertions, art, "qc",
+                demo.qcPayload(qcRevoke, ins, "PASSED", OffsetDateTime.now(), qcFail));
+        Map<String, Object> revokeJob = reevaluation.get(String.valueOf(
+                ((Map<?, ?>) revokeReceipt.get("reevalJob")).get("jobId")));
+        art.put("revokeJob", revokeJob);
+        String failState = jdbc.queryForObject(
+                "select state from lab.qc_record where tenant_id = ?::uuid and qc_id = ?",
+                String.class, tenant.tenantId(), qcFail);
+        assertions.add(new Assertion("backfill.qcFailureRevoked",
+                "REVOKED".equals(failState)
+                        && hasTransition(detailsOf(revokeJob), r2, "UNUSABLE", "USABLE"),
+                "qcState=" + failState + " transitions=" + detailsOf(revokeJob).path("transitions")));
+        Map<String, Object> postRevoke = publication.publish(tenant.code(), rep2).body();
+        assertions.add(new Assertion("backfill.publishVerifiedAfterRevocation",
+                "VERIFIED".equals(postRevoke.get("visibleState")),
+                "state=" + postRevoke.get("visibleState")));
+
+        // ---- 样例三：报告已被下游引用，历史版本不可覆盖 ----
+        String s3 = demo.uniqueKey("BF3-S");
+        String r3 = demo.uniqueKey("BF3-RES");
+        String rep3 = demo.uniqueKey("BF3-R");
+        receipt(tenant, assertions, art, "sample", demo.samplePayload(s3, "SOURCE-A"));
+        receipt(tenant, assertions, art, "result", backfillResult(r3, s3, ins, t0));
+        receipt(tenant, assertions, art, "report", demo.reportPayload(rep3, s3, 1, "referenced-original"));
+        Map<String, Object> refPublish = publication.publish(tenant.code(), rep3).body();
+        String originalHash = String.valueOf(refPublish.get("contentHash"));
+
+        receipt(tenant, assertions, art, "object", demo.objectPayload(demo.uniqueKey("BF3-OBJ"), rep3));
+        assertions.add(new Assertion("backfill.downstreamRefRegistered",
+                restrictions.isRevisionReferenced(tenant.tenantId(), rep3, 1),
+                "refs=" + restrictions.downstreamRefs(tenant.tenantId(), rep3)));
+
+        String qcFail2 = demo.uniqueKey("BF3-QCF");
+        receipt(tenant, assertions, art, "qc",
+                demo.qcPayload(qcFail2, ins, "FAILED", t0.minusMinutes(10), null));
+        Map<String, Object> restrictedPublish = publication.publish(tenant.code(), rep3).body();
+        Map<String, Object> pubRow = jdbc.queryForMap("""
+                select visible_state, content_hash from lab.report_publication
+                where tenant_id = ?::uuid and report_id = ? and revision = 1
+                """, tenant.tenantId(), rep3);
+        Long frozenEvents = jdbc.queryForObject("""
+                select count(*) from lab.publication_event
+                where tenant_id = ?::uuid and report_id = ? and frozen = true
+                  and visible_state = 'PENDING_VERIFICATION'
+                """, Long.class, tenant.tenantId(), rep3);
+        assertions.add(new Assertion("backfill.referencedVersionFrozen",
+                "PENDING_VERIFICATION".equals(restrictedPublish.get("visibleState"))
+                        && "VERIFIED".equals(pubRow.get("visible_state"))
+                        && originalHash.equals(pubRow.get("content_hash"))
+                        && frozenEvents != null && frozenEvents > 0,
+                "serveState=" + restrictedPublish.get("visibleState")
+                        + " frozenRow=" + pubRow.get("visible_state") + "/" + pubRow.get("content_hash")
+                        + " frozenEvents=" + frozenEvents));
+
+        // 同修订号的“更正”不得覆盖已被下游消费的历史版本。
+        receipt(tenant, assertions, art, "report", demo.reportPayload(rep3, s3, 1, "tampered-content"));
+        String spaceSchema = "OLD".equals(tenant.readSpace()) ? tenant.oldSchema() : tenant.newSchema();
+        String hashAfterTamper = jdbc.queryForObject(
+                "select content_hash from " + spaceSchema + ".report_revision where report_id = ? and revision = 1",
+                String.class, rep3);
+        Long immutableFindings = jdbc.queryForObject("""
+                select count(*) from lab.semantic_finding
+                where tenant_id = ?::uuid and rule_code = 'REPORT_REVISION_IMMUTABLE' and report_id = ?
+                """, Long.class, tenant.tenantId(), rep3);
+        assertions.add(new Assertion("backfill.immutableRevisionGuard",
+                originalHash.equals(hashAfterTamper) && immutableFindings != null && immutableFindings > 0,
+                "hashAfterTamper=" + hashAfterTamper + " findings=" + immutableFindings));
+
+        // 撤销第二次质控失败：三份报告全部恢复可发布，证据链完整（可重复运行的收敛）。
+        receipt(tenant, assertions, art, "qc",
+                demo.qcPayload(demo.uniqueKey("BF3-QCR"), ins, "PASSED", OffsetDateTime.now(), qcFail2));
+        boolean allVerified = true;
+        for (String rep : List.of(rep1, rep2, rep3)) {
+            Map<String, Object> p = publication.publish(tenant.code(), rep).body();
+            allVerified &= "VERIFIED".equals(p.get("visibleState"));
+        }
+        assertions.add(new Assertion("backfill.allRestrictionsReleased",
+                allVerified && restrictions.list(tenant.tenantId(), 100).stream()
+                        .noneMatch(r -> "ACTIVE".equals(r.get("status"))),
+                "allVerified=" + allVerified));
+        assertions.add(new Assertion("backfill.evidenceChainValid",
+                Boolean.TRUE.equals(evidence.verifyChain(tenant.tenantId()).get("valid")),
+                "chain=" + evidence.verifyChain(tenant.tenantId())));
+    }
+
+    private Map<String, Object> backfillResult(String resultId, String sampleId, String instrument,
+                                               OffsetDateTime measuredAt) {
+        Map<String, Object> p = demo.resultPayload(resultId, sampleId, "GLU", "5.4", "mmol/L",
+                "3.9", "5.5");
+        p.put("instrumentCode", instrument);
+        p.put("measuredAt", measuredAt.toString());
+        return p;
+    }
+
+    private JsonNode detailsOf(Map<String, Object> job) {
+        return crypto.readTree(String.valueOf(job.get("details")));
+    }
+
+    private JsonNode statsOf(Map<String, Object> job) {
+        return crypto.readTree(String.valueOf(job.get("stats")));
+    }
+
+    private boolean hasTransition(JsonNode details, String resultId, String from, String to) {
+        for (JsonNode t : details.path("transitions")) {
+            if (resultId.equals(t.path("resultId").asText())
+                    && from.equals(t.path("oldUsability").asText())
+                    && to.equals(t.path("newUsability").asText())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private long restrictionStatus(String tenantId, String reportId, String status) {
+        Long n = jdbc.queryForObject("""
+                select count(*) from lab.publication_restriction
+                where tenant_id = ?::uuid and report_id = ? and status = ?
+                """, Long.class, tenantId, reportId, status);
+        return n == null ? 0 : n;
+    }
+
+    /**
      * Brings a tenant to STEADY_OLD with no open fence or migration so a publish-centric
      * scenario observes the normal steady route rather than a leftover fence from an
      * earlier aborted run. Uses the real rollback path when possible.
@@ -477,7 +711,8 @@ public class ScenarioService {
     }
 
     public List<String> scenarios() {
-        return List.of("LATE_RESULT", "REPORT_REVISION", "ISOLATION_CHANGE", "FENCE_BURST");
+        return List.of("LATE_RESULT", "REPORT_REVISION", "ISOLATION_CHANGE", "FENCE_BURST",
+                "BACKFILL_REEVAL");
     }
 
     public Map<String, Object> runAll(String tenantCode) {

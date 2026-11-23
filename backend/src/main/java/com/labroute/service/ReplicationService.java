@@ -35,12 +35,15 @@ public class ReplicationService {
     private final CryptoSupport crypto;
     private final SpaceWriter writer;
     private final EvidenceService evidence;
+    private final AppliedMessageHooks hooks;
 
-    public ReplicationService(JdbcTemplate jdbc, CryptoSupport crypto, SpaceWriter writer, EvidenceService evidence) {
+    public ReplicationService(JdbcTemplate jdbc, CryptoSupport crypto, SpaceWriter writer,
+                              EvidenceService evidence, AppliedMessageHooks hooks) {
         this.jdbc = jdbc;
         this.crypto = crypto;
         this.writer = writer;
         this.evidence = evidence;
+        this.hooks = hooks;
     }
 
     // ---------- initial copy ----------
@@ -103,8 +106,11 @@ public class ReplicationService {
             upsertWatermark(mid, tenant.tenantId(), streamType, name, srcPos, dstPos,
                     markVerified && lag == 0 ? srcPos : null, lag);
         }
+        // Registry-bound messages (CALIBRATION / QC_RECORD) are control-plane writes and
+        // never replicate into a space, so they are excluded from the message watermark.
         Long intakePos = jdbc.queryForObject("""
-                select coalesce(max(seq),0) from lab.intake_message where tenant_id = ?::uuid
+                select coalesce(max(seq),0) from lab.intake_message
+                where tenant_id = ?::uuid and message_type not in ('CALIBRATION','QC_RECORD')
                 """, Long.class, tenant.tenantId());
         // A message is at the NEW position when it was applied there, either directly (NEW)
         // or via dual-write (OLD+NEW). Fence-applied messages are set to applied_space='NEW'
@@ -112,6 +118,7 @@ public class ReplicationService {
         long appliedNew = jdbc.queryForObject("""
                 select coalesce(max(seq),0) from lab.intake_message
                 where tenant_id = ?::uuid and applied_space in ('NEW','OLD+NEW')
+                  and message_type not in ('CALIBRATION','QC_RECORD')
                 """, Long.class, tenant.tenantId());
         upsertWatermark(mid, tenant.tenantId(), "MESSAGE", "intake", intakePos, appliedNew,
                 markVerified && intakePos != null && intakePos <= appliedNew ? intakePos : null,
@@ -238,10 +245,23 @@ public class ReplicationService {
         return s == null ? 0 : s;
     }
 
-    /** Applies one buffered fence message into NEW but NEVER into OLD: the fence only moves data forward. */
+    /**
+     * Applies one buffered fence message forward. Space-routed types go to NEW only (the
+     * fence never moves data backward); registry types (CALIBRATION / QC_RECORD) go to the
+     * singular control-plane registry and trigger their re-evaluation there.
+     */
     public void applyBufferedToNew(Tenant tenant, UUID messageId, long seq, String messageType,
                                   JsonNode payload, String fenceId) {
+        if (QualityService.isRegistryType(messageType)) {
+            hooks.applyRegistry(tenant, messageId, seq, messageType, payload);
+            jdbc.update("""
+                    update lab.intake_message set status = 'APPLIED_FROM_FENCE', applied_space = 'REGISTRY'
+                    where message_id = ?::uuid and tenant_id = ?::uuid
+                    """, messageId.toString(), tenant.tenantId());
+            return;
+        }
         writer.apply(tenant, "NEW", messageId, seq, messageType, payload);
+        hooks.afterSpaceApply(tenant, "NEW", messageId, seq, messageType, payload);
         jdbc.update("""
                 update lab.intake_message set status = 'APPLIED_FROM_FENCE', applied_space = 'NEW'
                 where message_id = ?::uuid and tenant_id = ?::uuid

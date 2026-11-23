@@ -87,6 +87,34 @@ public class IntakeController {
                 signature, idempotencyKey, body);
     }
 
+    @PostMapping("/calibration")
+    public ResponseEntity<Map<String, Object>> calibration(
+            @org.springframework.web.bind.annotation.PathVariable String tenantCode,
+            @RequestHeader(value = "X-Source-Code", required = false) String sourceCode,
+            @RequestHeader(value = "X-Key-Id", required = false) String keyId,
+            @RequestHeader(value = "X-Nonce", required = false) String nonce,
+            @RequestHeader(value = "X-Signed-At", required = false) String signedAt,
+            @RequestHeader(value = "X-Signature", required = false) String signature,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+            @RequestBody(required = false) String body) {
+        return handle(tenantCode, "/api/intake/calibration", sourceCode, keyId, nonce, signedAt,
+                signature, idempotencyKey, body);
+    }
+
+    @PostMapping("/qc")
+    public ResponseEntity<Map<String, Object>> qc(
+            @org.springframework.web.bind.annotation.PathVariable String tenantCode,
+            @RequestHeader(value = "X-Source-Code", required = false) String sourceCode,
+            @RequestHeader(value = "X-Key-Id", required = false) String keyId,
+            @RequestHeader(value = "X-Nonce", required = false) String nonce,
+            @RequestHeader(value = "X-Signed-At", required = false) String signedAt,
+            @RequestHeader(value = "X-Signature", required = false) String signature,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey,
+            @RequestBody(required = false) String body) {
+        return handle(tenantCode, "/api/intake/qc", sourceCode, keyId, nonce, signedAt,
+                signature, idempotencyKey, body);
+    }
+
     private ResponseEntity<Map<String, Object>> handle(String tenantCode, String endpoint, String sourceCode,
                                                        String keyId, String nonce, String signedAt,
                                                        String signature, String idempotencyKey, String body) {

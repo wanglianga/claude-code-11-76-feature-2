@@ -311,6 +311,147 @@ public class SchemaService {
               started_at timestamptz not null default now(),
               finished_at timestamptz
             );
+
+            -- 校准有效期图：每台仪器的校准记录与其有效期区间。补传记录按
+            -- (tenant, calibration_id) 幂等归并，seq 单调保证后到的更正覆盖先到的。
+            create table if not exists lab.calibration_record (
+              calibration_id text not null,
+              tenant_id uuid not null references lab.tenant(tenant_id) on delete cascade,
+              instrument_code text not null,
+              status text not null,
+              calibrated_at timestamptz,
+              valid_from timestamptz not null,
+              valid_until timestamptz not null,
+              message_id uuid not null,
+              seq bigint not null,
+              received_at timestamptz not null default now(),
+              primary key (tenant_id, calibration_id),
+              unique (tenant_id, message_id)
+            );
+            create index if not exists ix_calibration_instrument on lab.calibration_record(tenant_id, instrument_code, valid_from);
+
+            -- 质控水位器源数据：质控记录按 performed_at 排序决定某时刻的质控状态；
+            -- 撤销记录（revokes_qc_id 非空）本身不参与状态判定，只把被撤销记录置为 REVOKED。
+            create table if not exists lab.qc_record (
+              qc_id text not null,
+              tenant_id uuid not null references lab.tenant(tenant_id) on delete cascade,
+              instrument_code text not null,
+              qc_level text,
+              status text not null,
+              performed_at timestamptz not null,
+              revokes_qc_id text,
+              state text not null default 'ACTIVE',
+              message_id uuid not null,
+              seq bigint not null,
+              received_at timestamptz not null default now(),
+              primary key (tenant_id, qc_id),
+              unique (tenant_id, message_id)
+            );
+            create index if not exists ix_qc_instrument on lab.qc_record(tenant_id, instrument_code, performed_at);
+
+            -- 报告依赖索引（反向索引）：报告修订 -> 其样本的仪器结果 -> 仪器+测量时间。
+            -- 补传质控/校准按 (instrument, measured_at 窗口) 反查受影响报告，避免全量回放。
+            create table if not exists lab.report_dependency (
+              tenant_id uuid not null references lab.tenant(tenant_id) on delete cascade,
+              space_role text not null,
+              report_id text not null,
+              revision int not null,
+              sample_id text not null,
+              result_id text not null,
+              instrument_code text,
+              measured_at timestamptz,
+              indexed_at timestamptz not null default now(),
+              primary key (tenant_id, space_role, report_id, revision, result_id)
+            );
+            create index if not exists ix_dependency_window on lab.report_dependency(tenant_id, space_role, instrument_code, measured_at);
+            create index if not exists ix_dependency_result on lab.report_dependency(tenant_id, space_role, result_id);
+
+            -- 结果可用性：每台仪器结果在某个空间下最近一次评估的可用性（旧->新迁移记在 reeval_job.details）。
+            create table if not exists lab.result_usability (
+              tenant_id uuid not null references lab.tenant(tenant_id) on delete cascade,
+              space_role text not null,
+              result_id text not null,
+              usability text not null,
+              reason text,
+              qc_id text,
+              calibration_id text,
+              job_id uuid,
+              evaluated_at timestamptz not null default now(),
+              primary key (tenant_id, space_role, result_id)
+            );
+
+            create table if not exists lab.report_usability (
+              tenant_id uuid not null references lab.tenant(tenant_id) on delete cascade,
+              report_id text not null,
+              usability text not null,
+              evaluated_at timestamptz not null default now(),
+              job_id uuid,
+              primary key (tenant_id, report_id)
+            );
+
+            -- 重评估计划器：每个作业记录触发源、策略、窗口与影响统计；同步执行但全程留账。
+            create table if not exists lab.reeval_job (
+              job_id uuid primary key,
+              tenant_id uuid not null references lab.tenant(tenant_id) on delete cascade,
+              trigger_type text not null,
+              strategy text not null,
+              instrument_code text,
+              window_from timestamptz,
+              window_to timestamptz,
+              space_role text,
+              status text not null default 'PLANNED',
+              trigger_message_id uuid,
+              predates_watermark boolean not null default false,
+              stats jsonb not null default '{}'::jsonb,
+              details jsonb not null default '{}'::jsonb,
+              created_at timestamptz not null default now(),
+              finished_at timestamptz
+            );
+            create index if not exists ix_reeval_tenant on lab.reeval_job(tenant_id, created_at desc);
+
+            -- 发布限制册：可用性降级且报告已发布过 -> ACTIVE 限制；恢复可用 -> RELEASED。
+            create table if not exists lab.publication_restriction (
+              restriction_id uuid primary key,
+              tenant_id uuid not null references lab.tenant(tenant_id) on delete cascade,
+              report_id text not null,
+              reason_code text not null,
+              status text not null default 'ACTIVE',
+              old_usability text,
+              new_usability text,
+              job_id uuid,
+              downstream_refs jsonb not null default '[]'::jsonb,
+              created_at timestamptz not null default now(),
+              released_at timestamptz,
+              release_reason text
+            );
+            create index if not exists ix_restriction_active on lab.publication_restriction(tenant_id, report_id) where status = 'ACTIVE';
+
+            -- 下游引用：报告某修订被下游（对象归档/外部系统）引用过 -> 该历史版本从此不可覆盖。
+            create table if not exists lab.report_downstream_ref (
+              ref_id uuid primary key,
+              tenant_id uuid not null references lab.tenant(tenant_id) on delete cascade,
+              report_id text not null,
+              revision int,
+              referenced_by text not null,
+              message_id uuid,
+              created_at timestamptz not null default now(),
+              unique (tenant_id, report_id, revision, referenced_by)
+            );
+
+            -- 发布事件账：每次发布应答的只增历史；被下游引用的版本行冻结后，后续应答只落事件账。
+            create table if not exists lab.publication_event (
+              event_id uuid primary key,
+              tenant_id uuid not null references lab.tenant(tenant_id) on delete cascade,
+              report_id text not null,
+              revision int not null,
+              source_space text,
+              visible_state text not null,
+              content_hash text,
+              pending_reason text,
+              frozen boolean not null default false,
+              served_at timestamptz not null default now()
+            );
+            create index if not exists ix_publication_event on lab.publication_event(tenant_id, report_id, served_at desc);
             """;
 
     /**

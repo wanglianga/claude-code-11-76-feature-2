@@ -12,6 +12,9 @@ Covered scenarios (the ones required by the brief):
   2. REPORT_REVISION revision 2 supersedes revision 1; invalid relation is rejected but kept
   3. ISOLATION_CHANGE  tenant isolation policy changes; cross-tenant key is refused
   4. FENCE_BURST     three messages arrive back-to-back inside a switch fence
+  5. BACKFILL_REEVAL backfilled QC/calibration records re-evaluate published reports:
+                     calibration arriving after the result, a revoked QC failure, and a
+                     downstream-referenced report whose history must not be overwritten
 
 Run:
   python3 scripts/e2e_verify.py                # against http://127.0.0.1:8080
@@ -36,6 +39,8 @@ BASE = os.environ.get("BASE", "http://127.0.0.1:8080")
 OPERATOR = os.environ.get("OPERATOR_TOKEN", "labroute-operator-demo")
 TENANT = os.environ.get("TENANT", "lab-harbor")
 PEER = os.environ.get("PEER_TENANT", "lab-orion")
+
+INTAKE_SCOPES = "intake:sample,intake:result,intake:report,intake:object,intake:calibration,intake:qc"
 
 RESULTS: list[tuple[bool, str, str]] = []
 
@@ -265,7 +270,7 @@ def scenario_isolation_change() -> None:
     st, detail = http("GET", f"/api/tenants/{TENANT}")
     for c in detail.get("credentials", []):
         http("POST", f"/api/tenants/{TENANT}/credentials/{c['credentialId']}/reauthorise",
-             {"scopes": "intake:sample,intake:result,intake:report,intake:object"}, operator_headers())
+             {"scopes": INTAKE_SCOPES}, operator_headers())
     record(True, "isolation.restored_and_reauthorised", "policy restored, credentials re-issued")
 
 
@@ -350,6 +355,191 @@ def scenario_fence_burst() -> None:
            f"space={restored.get('sourceSpace')} state={restored.get('visibleState')}")
 
 
+def scenario_backfill_reeval() -> None:
+    print("\n=== 5. 补传质控/校准触发重评估 (BACKFILL_REEVAL) ===")
+    steady(TENANT)
+    # Credentials from an older seed may predate the quality scopes; re-issue them.
+    st, detail = http("GET", f"/api/tenants/{TENANT}")
+    for c in detail.get("credentials", []):
+        http("POST", f"/api/tenants/{TENANT}/credentials/{c['credentialId']}/reauthorise",
+             {"scopes": INTAKE_SCOPES}, operator_headers())
+
+    ins = "INS-" + uuid.uuid4().hex[:6].upper()
+    t0 = datetime.now(timezone.utc) - timedelta(hours=2)
+
+    def result_on(rid: str, sid: str) -> dict:
+        p = result_payload(rid, sid)
+        p["instrumentCode"] = ins
+        p["measuredAt"] = t0.isoformat()
+        return p
+
+    def reevaluate(strategy: str, frm: datetime, to: datetime) -> dict:
+        st, job = http("POST", f"/api/tenants/{TENANT}/quality/reevaluate",
+                       {"instrumentCode": ins, "strategy": strategy,
+                        "from": frm.isoformat(), "to": to.isoformat()}, operator_headers())
+        return job
+
+    def transitions(job: dict) -> list:
+        return (job.get("details") or {}).get("transitions") or []
+
+    # ---- 样例一：校准在结果后补到 ----
+    sid1, rid1, rep1 = uniq("E2E-B1-S"), uniq("E2E-B1-RES"), uniq("E2E-B1-R")
+    deliver(TENANT, "sample", sample_payload(sid1))
+    deliver(TENANT, "result", result_on(rid1, sid1))
+    deliver(TENANT, "report", report_payload(rep1, sid1, 1))
+    st, pub = http("GET", f"/api/tenant/{TENANT}/publish/reports/{rep1}")
+    record(st == 200 and pub.get("visibleState") == "VERIFIED",
+           "backfill.report_verified_before_calibration",
+           f"http={st} state={pub.get('visibleState')}")
+
+    gap_job = reevaluate("INCREMENTAL", t0 - timedelta(hours=1), t0 + timedelta(hours=1))
+    gap_tr = [t for t in transitions(gap_job)
+              if t.get("resultId") == rid1 and t.get("newUsability") == "SUSPECT"]
+    pending_review = (gap_job.get("details") or {}).get("pendingReviewReports") or []
+    record(bool(gap_tr) and rep1 in pending_review, "backfill.gap_marked_suspect",
+           f"transitions={gap_tr} pendingReview={pending_review}")
+
+    st, pub = http("GET", f"/api/tenant/{TENANT}/publish/reports/{rep1}")
+    record(st == 202 and pub.get("visibleState") == "PENDING_VERIFICATION"
+           and pub.get("restrictions"), "backfill.publish_pending_under_gap",
+           f"http={st} state={pub.get('visibleState')} reason={pub.get('pendingReason')}")
+
+    st, cal_receipt, _ = deliver(TENANT, "calibration", {
+        "calibrationId": uniq("E2E-B1-CAL"), "instrumentCode": ins, "status": "PASSED",
+        "validFrom": (t0 - timedelta(hours=2)).isoformat(),
+        "validUntil": (t0 + timedelta(hours=24)).isoformat()})
+    record(st == 200 and cal_receipt.get("appliedSpace") == "REGISTRY"
+           and cal_receipt.get("reevalJob", {}).get("jobId"),
+           "backfill.calibration_receipt_with_job",
+           f"http={st} space={cal_receipt.get('appliedSpace')} job={cal_receipt.get('reevalJob')}")
+    st, pub = http("GET", f"/api/tenant/{TENANT}/publish/reports/{rep1}")
+    record(st == 200 and pub.get("visibleState") == "VERIFIED",
+           "backfill.publish_verified_after_calibration", f"http={st} state={pub.get('visibleState')}")
+
+    st, restrictions = http("GET", f"/api/tenants/{TENANT}/quality/restrictions")
+    rep1_restrictions = [r for r in restrictions.get("restrictions", []) if r.get("reportId") == rep1]
+    record(bool(rep1_restrictions) and all(r.get("status") == "RELEASED" for r in rep1_restrictions),
+           "backfill.restriction_released_after_calibration",
+           f"statuses={[r.get('status') for r in rep1_restrictions]}")
+
+    st, calmap = http("GET", f"/api/tenants/{TENANT}/quality/calibrations?instrument={ins}")
+    instruments = calmap.get("instruments", [])
+    record(st == 200 and instruments and instruments[0].get("coverage"),
+           "backfill.calibration_map_served",
+           f"instruments={len(instruments)} coverage={instruments[0].get('coverage') if instruments else None}")
+
+    # ---- 样例二：质控失败被撤销 ----
+    sid2, rid2, rep2 = uniq("E2E-B2-S"), uniq("E2E-B2-RES"), uniq("E2E-B2-R")
+    deliver(TENANT, "sample", sample_payload(sid2))
+    deliver(TENANT, "result", result_on(rid2, sid2))
+    deliver(TENANT, "report", report_payload(rep2, sid2, 1))
+    st, pub = http("GET", f"/api/tenant/{TENANT}/publish/reports/{rep2}")
+    record(pub.get("visibleState") == "VERIFIED", "backfill.report2_verified_before_qc",
+           f"state={pub.get('visibleState')}")
+
+    qc_fail = uniq("E2E-B2-QCF")
+    st, qc_receipt, _ = deliver(TENANT, "qc", {
+        "qcId": qc_fail, "instrumentCode": ins, "status": "FAILED",
+        "performedAt": (t0 - timedelta(minutes=30)).isoformat()})
+    record(st == 200 and qc_receipt.get("reevalJob", {}).get("jobId"),
+           "backfill.qc_failure_receipt_with_job", f"http={st} job={qc_receipt.get('reevalJob')}")
+    st, pub = http("GET", f"/api/tenant/{TENANT}/publish/reports/{rep2}")
+    record(st == 202 and "QC_FAILED" in str(pub.get("pendingReason")),
+           "backfill.qc_failure_degrades", f"http={st} reason={pub.get('pendingReason')}")
+
+    st, wm = http("GET", f"/api/tenants/{TENANT}/quality/qc-watermarks?instrument={ins}")
+    inst = (wm.get("instruments") or [{}])[0]
+    record(inst.get("currentStatus") == "FAILED"
+           and any(w.get("open") for w in inst.get("failureWindows", [])),
+           "backfill.qc_watermark_open_failure",
+           f"current={inst.get('currentStatus')} windows={inst.get('failureWindows')}")
+
+    replay_job = reevaluate("REPLAY", t0 - timedelta(hours=1), t0 + timedelta(hours=1))
+    rstats = replay_job.get("stats") or {}
+    record(rstats.get("indexUsed") is False and rstats.get("affectedResults", 0) >= 2
+           and rstats.get("indexEdgesHealed", 0) >= 2,
+           "backfill.replay_strategy_scans_and_heals", f"stats={rstats}")
+
+    st, revoke_receipt, _ = deliver(TENANT, "qc", {
+        "qcId": uniq("E2E-B2-QCR"), "instrumentCode": ins, "status": "PASSED",
+        "performedAt": datetime.now(timezone.utc).isoformat(), "revokesQcId": qc_fail})
+    st, wm = http("GET", f"/api/tenants/{TENANT}/quality/qc-watermarks?instrument={ins}")
+    inst = (wm.get("instruments") or [{}])[0]
+    revoked = [r for r in inst.get("records", [])
+               if r.get("qcId") == qc_fail and r.get("state") == "REVOKED"]
+    record(bool(revoked) and inst.get("currentStatus") != "FAILED",
+           "backfill.qc_failure_revoked",
+           f"revoked={bool(revoked)} current={inst.get('currentStatus')}")
+    st, pub = http("GET", f"/api/tenant/{TENANT}/publish/reports/{rep2}")
+    record(st == 200 and pub.get("visibleState") == "VERIFIED",
+           "backfill.publish_verified_after_revocation", f"http={st} state={pub.get('visibleState')}")
+
+    # ---- 样例三：报告已被下游引用，历史版本不可覆盖 ----
+    sid3, rid3, rep3 = uniq("E2E-B3-S"), uniq("E2E-B3-RES"), uniq("E2E-B3-R")
+    deliver(TENANT, "sample", sample_payload(sid3))
+    deliver(TENANT, "result", result_on(rid3, sid3))
+    deliver(TENANT, "report", report_payload(rep3, sid3, 1))
+    st, pub = http("GET", f"/api/tenant/{TENANT}/publish/reports/{rep3}")
+    original_hash = pub.get("contentHash")
+    record(st == 200 and pub.get("visibleState") == "VERIFIED" and original_hash,
+           "backfill.report3_verified_before_reference", f"hash={original_hash}")
+
+    st, obj_receipt, _ = deliver(TENANT, "object", {
+        "objectKey": uniq("E2E-B3-OBJ"), "objectType": "RAW_PDF",
+        "content": {"reportId": rep3, "pages": 2}})
+    st, refs = http("GET", f"/api/tenants/{TENANT}/quality/downstream-refs?reportId={rep3}")
+    record(bool(refs.get("refs")), "backfill.downstream_ref_registered",
+           f"refs={refs.get('refs')}")
+
+    qc_fail2 = uniq("E2E-B3-QCF")
+    deliver(TENANT, "qc", {"qcId": qc_fail2, "instrumentCode": ins, "status": "FAILED",
+                           "performedAt": (t0 - timedelta(minutes=10)).isoformat()})
+    st, pub = http("GET", f"/api/tenant/{TENANT}/publish/reports/{rep3}")
+    record(st == 202 and pub.get("lastVerifiedContentHash") == original_hash,
+           "backfill.restricted_serve_names_frozen_version",
+           f"http={st} lastVerifiedHash={pub.get('lastVerifiedContentHash')}")
+
+    # The frozen publication row still shows VERIFIED + the original hash (not overwritten).
+    st, replay = http("GET", f"/api/tenant/{TENANT}/publish/reports/{rep3}/replay")
+    pub_rows = [p for p in replay.get("publications", []) if p.get("revision") == 1]
+    record(bool(pub_rows) and pub_rows[0].get("visibleState") == "VERIFIED"
+           and pub_rows[0].get("contentHash") == original_hash,
+           "backfill.referenced_publication_row_frozen",
+           f"row={pub_rows[0] if pub_rows else None}")
+
+    # A diverging 'correction' for the same revision must not overwrite the consumed version.
+    tampered = report_payload(rep3, sid3, 1)
+    tampered["content"]["label"] = "tampered-content"
+    deliver(TENANT, "report", tampered)
+    st, chain = http("GET", f"/api/tenants/{TENANT}/samples/{sid3}/chain?space=READ")
+    hashes = [r.get("content_hash") for r in chain.get("reports", []) if r.get("report_id") == rep3]
+    st, findings = http("GET", f"/api/tenants/{TENANT}/findings?limit=50")
+    immutable_findings = [f for f in findings.get("findings", [])
+                          if f.get("ruleCode") == "REPORT_REVISION_IMMUTABLE"
+                          and f.get("reportId") == rep3]
+    record(hashes == [original_hash] and bool(immutable_findings),
+           "backfill.immutable_revision_guard",
+           f"hashes={hashes} findings={len(immutable_findings)}")
+
+    # Revoke the second failure: every restricted report recovers; register has no ACTIVE left.
+    deliver(TENANT, "qc", {"qcId": uniq("E2E-B3-QCR"), "instrumentCode": ins, "status": "PASSED",
+                           "performedAt": datetime.now(timezone.utc).isoformat(),
+                           "revokesQcId": qc_fail2})
+    states = []
+    for rep in (rep1, rep2, rep3):
+        st, pub = http("GET", f"/api/tenant/{TENANT}/publish/reports/{rep}")
+        states.append(pub.get("visibleState"))
+    st, restrictions = http("GET", f"/api/tenants/{TENANT}/quality/restrictions")
+    active = [r for r in restrictions.get("restrictions", []) if r.get("status") == "ACTIVE"]
+    record(states == ["VERIFIED", "VERIFIED", "VERIFIED"] and not active,
+           "backfill.all_restrictions_released", f"states={states} active={len(active)}")
+
+    st, deps = http("GET", f"/api/tenants/{TENANT}/quality/dependencies")
+    edges = sum(s.get("edges", 0) for s in deps.get("spaces", []))
+    record(edges > 0, "backfill.dependency_index_maintained",
+           f"spaces={deps.get('spaces')}")
+
+
 def main() -> int:
     print(f"LabRoute e2e verification against {BASE} (tenant={TENANT})")
     st, health = http("GET", "/api/health")
@@ -366,6 +556,7 @@ def main() -> int:
     scenario_report_revision()
     scenario_isolation_change()
     scenario_fence_burst()
+    scenario_backfill_reeval()
     return finish()
 
 

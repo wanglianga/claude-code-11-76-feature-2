@@ -59,7 +59,7 @@ public class PolicyController {
         guard(request);
         Tenant t = tenants.requireByCode(code);
         return policies.reauthorise(t, credentialId,
-                (String) body.getOrDefault("scopes", "intake:sample,intake:result,intake:report,intake:object"));
+                (String) body.getOrDefault("scopes", com.labroute.service.AuthService.INTAKE_SCOPES));
     }
 
     @GetMapping("/isolation/verify")

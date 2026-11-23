@@ -60,6 +60,8 @@ public class DemoDataService {
             case "result" -> "/api/intake/result";
             case "report" -> "/api/intake/report";
             case "object" -> "/api/intake/object";
+            case "calibration" -> "/api/intake/calibration";
+            case "qc" -> "/api/intake/qc";
             default -> throw ApiException.badRequest("KIND_INVALID", "unknown demo kind " + kind);
         };
         String sourceCode = String.valueOf(payload.getOrDefault("sourceCode", "SOURCE-A"));
@@ -199,6 +201,33 @@ public class DemoDataService {
         return p;
     }
 
+    public Map<String, Object> calibrationPayload(String calibrationId, String instrumentCode,
+                                                  OffsetDateTime validFrom, OffsetDateTime validUntil,
+                                                  String status) {
+        Map<String, Object> p = new LinkedHashMap<>();
+        p.put("calibrationId", calibrationId);
+        p.put("instrumentCode", instrumentCode);
+        p.put("status", status);
+        p.put("calibratedAt", validFrom.toString());
+        p.put("validFrom", validFrom.toString());
+        p.put("validUntil", validUntil.toString());
+        return p;
+    }
+
+    public Map<String, Object> qcPayload(String qcId, String instrumentCode, String status,
+                                         OffsetDateTime performedAt, String revokesQcId) {
+        Map<String, Object> p = new LinkedHashMap<>();
+        p.put("qcId", qcId);
+        p.put("instrumentCode", instrumentCode);
+        p.put("qcLevel", "L1");
+        p.put("status", status);
+        p.put("performedAt", performedAt.toString());
+        if (revokesQcId != null) {
+            p.put("revokesQcId", revokesQcId);
+        }
+        return p;
+    }
+
     // ---------- seeding ----------
 
     public void seedIfEmpty() {
@@ -226,7 +255,7 @@ public class DemoDataService {
         for (String source : sources) {
             auth.addCredential(tenant.tenantId(), source,
                     "STRICT".equals(tenant.isolationLevel()) ? secret + "-strict" : secret,
-                    "intake:sample,intake:result,intake:report,intake:object");
+                    AuthService.INTAKE_SCOPES);
         }
         // Pre-existing history in OLD so the space is not empty on first visit.
         String sampleId = code.toUpperCase().replace('-', '_') + "-S0001";
@@ -234,6 +263,14 @@ public class DemoDataService {
         deliveryBestEffort(tenant, "result", resultPayload(sampleId + "-R1", sampleId,
                 "GLU", "5.4", "mmol/L", "3.9", "5.5"));
         deliveryBestEffort(tenant, "report", reportPayload(sampleId + "-REP", sampleId, 1, "baseline"));
+        // Baseline quality registry: a passed calibration covering the trailing window and
+        // a passed QC, so the seeded result evaluates USABLE from the start.
+        OffsetDateTime now = OffsetDateTime.now();
+        String prefix = code.toUpperCase().replace('-', '_');
+        deliveryBestEffort(tenant, "calibration", calibrationPayload(prefix + "-CAL-SEED", "AU5800",
+                now.minusDays(30), now.plusDays(30), "PASSED"));
+        deliveryBestEffort(tenant, "qc", qcPayload(prefix + "-QC-SEED", "AU5800", "PASSED",
+                now.minusHours(3), null));
     }
 
     private void deliveryBestEffort(Tenant tenant, String kind, Map<String, Object> payload) {

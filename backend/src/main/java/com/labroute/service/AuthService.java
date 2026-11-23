@@ -123,6 +123,10 @@ public class AuthService {
         return endpoint.replaceFirst("^/api/", "").replace('/', ':');
     }
 
+    /** Full intake scope set granted to demo/source credentials, including the quality registry. */
+    public static final String INTAKE_SCOPES =
+            "intake:sample,intake:result,intake:report,intake:object,intake:calibration,intake:qc";
+
     private boolean scopeAllows(String scopes, String endpointScope) {
         String required = scopeOf(endpointScope);
         for (String s : scopes.split("[,\\s]+")) {

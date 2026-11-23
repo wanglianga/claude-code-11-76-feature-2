@@ -15,7 +15,8 @@ const META = {
   LATE_RESULT: { title: '仪器迟到结果', desc: '结果在报告发布后到达；回执持久化、报告可回放、来源空间可命名。' },
   REPORT_REVISION: { title: '报告修订', desc: '修订 2 取代修订 1；发布服务最新已验证版本，历史完整；非法修订关系被拒收但保留。' },
   ISOLATION_CHANGE: { title: '租户隔离策略变化', desc: '策略版本提升、凭据收紧、跨租户密钥被拒、空间无共享主键。' },
-  FENCE_BURST: { title: '切换围栏内三连消息', desc: '围栏内连续三条消息按序回执并缓冲，发布显式待验证，按序排空后放行，证据可回放并回退。' }
+  FENCE_BURST: { title: '切换围栏内三连消息', desc: '围栏内连续三条消息按序回执并缓冲，发布显式待验证，按序排空后放行，证据可回放并回退。' },
+  BACKFILL_REEVAL: { title: '补传质控/校准重评估', desc: '校准在结果后补到、质控失败被撤销、报告已被下游引用：核验新旧可用性、待复核范围与不可覆盖的历史版本。' }
 }
 
 async function load() {
@@ -84,7 +85,7 @@ const total = computed(() => (current.value?.assertions || []).length)
   <div class="topbar">
     <div>
       <h2>验证实验室 <span class="sub">{{ tenant }}</span></h2>
-      <div class="sub">四个确定性场景经真实签名网关与服务执行，逐条断言均附证据</div>
+      <div class="sub">五个确定性场景经真实签名网关与服务执行，逐条断言均附证据</div>
     </div>
     <div class="spacer"></div>
     <button class="primary" :disabled="!!running" @click="runAll">运行全部</button>
